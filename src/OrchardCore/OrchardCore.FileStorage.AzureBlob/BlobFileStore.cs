@@ -93,48 +93,9 @@ namespace OrchardCore.FileStorage.AzureBlob
 
         public async Task<IEnumerable<IFileStoreEntry>> GetDirectoryContentAsync(string path = null, bool includeSubDirectories = false)
         {
-            var results = new List<IFileStoreEntry>();
+            var results = new ConcurrentBag<IFileStoreEntry>();
 
-            var prefix = this.Combine(_basePrefix, path);
-            prefix = NormalizePrefix(prefix);
-
-            var page = _blobContainer.GetBlobsByHierarchyAsync(BlobTraits.Metadata, BlobStates.None, "/", prefix);
-            await foreach (var blob in page)
-            {
-                if (blob.IsPrefix)
-                {
-                    var folderPath = blob.Prefix;
-                    if (!String.IsNullOrEmpty(_basePrefix))
-                    {
-                        folderPath = folderPath.Substring(_basePrefix.Length - 1);
-                    }
-
-                    folderPath = folderPath.Trim('/');
-                    results.Add(new BlobDirectory(folderPath, _clock.UtcNow));
-                }
-                else
-                {
-                    var itemName = Path.GetFileName(WebUtility.UrlDecode(blob.Blob.Name)).Trim('/');
-                    // Ignore directory marker files.
-                    if (includeSubDirectories || itemName != _directoryMarkerFileName)
-                    {
-                        var itemPath = this.Combine(path.Trim('/'), itemName);
-                        results.Add(new BlobFile(itemPath, blob.Blob.Properties.ContentLength, blob.Blob.Properties.LastModified));
-                    }
-                }
-            }
-
-            if (includeSubDirectories)
-            {
-                var directories = results.Where(x => x.IsDirectory).ToArray();
-                // TODO Parralel.
-                foreach(var directory in directories)
-                {
-                    var nextResults = await this.GetDirectoryContentAsync(directory.Path, true);
-
-                    results.AddRange(nextResults);
-                }
-            }
+            await GetDirectoryContentInternalAsync(results, path, includeSubDirectories);
 
             return results
                     .OrderByDescending(x => x.IsDirectory)
@@ -329,5 +290,50 @@ namespace OrchardCore.FileStorage.AzureBlob
                 return prefix;
             }
         }
+
+        private async Task GetDirectoryContentInternalAsync(ConcurrentBag<IFileStoreEntry> entries, string path = null, bool includeSubDirectories = false)
+        {
+            var results = new ConcurrentBag<IFileStoreEntry>();
+
+            var prefix = this.Combine(_basePrefix, path);
+            prefix = NormalizePrefix(prefix);
+
+            var page = _blobContainer.GetBlobsByHierarchyAsync(BlobTraits.Metadata, BlobStates.None, "/", prefix);
+            await foreach (var blob in page)
+            {
+                if (blob.IsPrefix)
+                {
+                    var folderPath = blob.Prefix;
+                    if (!String.IsNullOrEmpty(_basePrefix))
+                    {
+                        folderPath = folderPath.Substring(_basePrefix.Length - 1);
+                    }
+
+                    folderPath = folderPath.Trim('/');
+                    results.Add(new BlobDirectory(folderPath, _clock.UtcNow));
+                }
+                else
+                {
+                    var itemName = Path.GetFileName(WebUtility.UrlDecode(blob.Blob.Name)).Trim('/');
+                    // Ignore directory marker files.
+                    if (includeSubDirectories || itemName != _directoryMarkerFileName)
+                    {
+                        // Blob directories return a leading / but as the file store needs to be normalized to a relative path we trim.
+                        var itemPath = this.Combine(path.Trim('/'), itemName);
+                        results.Add(new BlobFile(itemPath, blob.Blob.Properties.ContentLength, blob.Blob.Properties.LastModified));
+                    }
+                }
+            }
+
+            if (includeSubDirectories)
+            {
+                await results.Where(x => x.IsDirectory).ForEachAsync(async x => await GetDirectoryContentInternalAsync(results, x.Path, true));
+            }
+
+            foreach(var result in results)
+            {
+                entries.Add(result);
+            }
+        }        
     }
 }
